@@ -9,11 +9,18 @@ import (
 	"time"
 )
 
+// MountPollRetries and MountPollIntervalMs control the mount detection polling.
+var MountPollRetries = 30
+var MountPollIntervalMs = 100
+
 // WaitForMount 轮询 /proc/mounts 等待设备挂载
 func WaitForMount(devPath string) string {
-	// 尝试 3 秒，因为 Udev event 触发时，文件系统可能还没挂载好
-	for i := 0; i < 30; i++ {
-		f, _ := os.Open("/proc/mounts")
+	for i := 0; i < MountPollRetries; i++ {
+		f, err := os.Open("/proc/mounts")
+		if err != nil {
+			LogSugar.Errorf("WaitForMount: cannot open /proc/mounts: %v", err)
+			return ""
+		}
 		scanner := bufio.NewScanner(f)
 		for scanner.Scan() {
 			fields := strings.Fields(scanner.Text())
@@ -23,7 +30,7 @@ func WaitForMount(devPath string) string {
 			}
 		}
 		f.Close()
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(time.Duration(MountPollIntervalMs) * time.Millisecond)
 	}
 	return ""
 }

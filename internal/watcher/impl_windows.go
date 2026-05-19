@@ -2,7 +2,7 @@
 
 package watcher
 
-import "usbSentry/internal/model"
+import "github.com/Hara602/usbSentry/internal/model"
 
 type winWatcher struct{}
 

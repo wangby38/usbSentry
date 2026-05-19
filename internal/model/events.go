@@ -11,8 +11,13 @@ type USBEvent struct {
 	IdProduct  string
 	Product    string
 	Serial     string
-	DeviceType string // "udisk", "badusb_suspect"
-	TimeStamp  time.Time
+	DeviceType       string // "udisk", "badusb_suspect"
+	Manufacturer     string // USB device manufacturer string
+	Speed            string // USB speed (e.g., "480", "5000")
+	BcdDevice        string // USB spec version (bcdDevice)
+	BDeviceClass     string // Device class code
+	BDeviceSubClass  string // Device subclass code
+	TimeStamp        time.Time
 }
 
 type FileEvent struct {

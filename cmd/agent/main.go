@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"os"
 	"os/signal"
 	"syscall"
@@ -13,12 +14,28 @@ import (
 )
 
 func main() {
+	// CLI flags
+	var (
+		dbPath         = flag.String("db", "./internal/db/blacklist.db", "Path to SQLite blacklist/whitelist database")
+		mountPollMs    = flag.Int("mount-poll-ms", 100, "Mount detection polling interval in milliseconds")
+		mountRetries   = flag.Int("mount-retries", 30, "Number of mount detection retries")
+		eventBufSize   = flag.Int("event-buf", 100, "File event channel buffer size")
+		usbBufSize     = flag.Int("usb-buf", 10, "USB event channel buffer size")
+	)
+	flag.Parse()
+
+	// Apply CLI flags to package-level config
+	sysutil.MountPollIntervalMs = *mountPollMs
+	sysutil.MountPollRetries = *mountRetries
+	monitor.EventChannelSize = *eventBufSize
+	watcher.EventChannelSize = *usbBufSize
+
 	// 初始化日志
 	sysutil.InitLogger()
 	defer sysutil.Log.Sync()
 
 	// 初始化黑白名单数据库
-	if err := blackwhitelist.InitBlackWhiteDB("./internal/db/blacklist.db"); err != nil {
+	if err := blackwhitelist.InitBlackWhiteDB(*dbPath); err != nil {
 		sysutil.Log.Fatal("blackwhitelist database init failed!")
 	}
 
@@ -38,6 +55,7 @@ func main() {
 
 	// 3. 启动
 	fileMon.Start()
+	fileMon.StartStatsReporter(60) // report every 60 seconds
 	defer fileMon.Stop()
 
 	usbEvents, err := devWatcher.Start()
@@ -48,7 +66,7 @@ func main() {
 
 	// 捕获操作系统信号，优雅关闭服务器或后台服务
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
 	for {
 		select {
@@ -74,6 +92,9 @@ func main() {
 				}
 			} else if dev.Action == "remove" {
 				sysutil.Log.Info("❌ USB Removed", zap.String("path", dev.DevicePath))
+				if dev.MountPoint != "" {
+					fileMon.RemoveWatch(dev.MountPoint)
+				}
 			}
 
 		// --- 文件事件 ---
@@ -85,9 +106,14 @@ func main() {
 				zap.Int32("pid", activity.PID),           // PID
 			)
 
-		case <-sigCh:
-			sysutil.Log.Info("Shutting down...")
-			return
+		case sig := <-sigCh:
+			switch sig {
+			case syscall.SIGHUP:
+				sysutil.Log.Info("Received SIGHUP, config reload not yet implemented")
+			default:
+				sysutil.Log.Info("Shutting down...")
+				return
+			}
 		}
 
 	}

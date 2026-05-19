@@ -2,7 +2,7 @@
 
 package monitor
 
-import "usbSentry/internal/model"
+import "github.com/Hara602/usbSentry/internal/model"
 
 type winMonitor struct{}
 
@@ -12,3 +12,4 @@ func (m *winMonitor) Stop()                          {}
 func (m *winMonitor) AddWatch(p string) error        { return nil }
 func (m *winMonitor) RemoveWatch(p string)           {}
 func (m *winMonitor) Events() <-chan model.FileEvent { return nil }
+func (m *winMonitor) StartStatsReporter(i int)       {}

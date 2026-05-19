@@ -2,10 +2,10 @@ package watcher
 
 import (
 	"bufio"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Hara602/usbSentry/internal/analysis"
@@ -19,11 +19,12 @@ import (
 type linuxWatcher struct {
 	events chan model.USBEvent
 	stop   chan struct{}
+	wg     sync.WaitGroup
 }
 
 func newWatcher() DeviceWatcher {
 	return &linuxWatcher{
-		events: make(chan model.USBEvent, 10),
+		events: make(chan model.USBEvent, EventChannelSize),
 		stop:   make(chan struct{}),
 	}
 }
@@ -40,7 +41,9 @@ func (w *linuxWatcher) Start() (<-chan model.USBEvent, error) {
 	quit := conn.Monitor(queue, errChan, nil)
 
 	// 启动监听 goroutine
+	w.wg.Add(1)
 	go func() {
+		defer w.wg.Done()
 		// 确保退出时关闭连接
 		defer conn.Close()
 
@@ -70,6 +73,7 @@ func (w *linuxWatcher) Start() (<-chan model.USBEvent, error) {
 }
 func (w *linuxWatcher) Stop() {
 	close(w.stop)
+	w.wg.Wait()
 }
 func (w *linuxWatcher) handleAdd(uevent netlink.UEvent) {
 	// 获取基础信息
@@ -98,6 +102,15 @@ func (w *linuxWatcher) handleAdd(uevent netlink.UEvent) {
 	// BadUSB 分析
 	isBad, devType := analysis.CheckBadUSB(usbRoot)
 
+	// Extended device info from sysfs
+	info := CollectDeviceInfo(usbRoot)
+	sysutil.Log.Info("Extended device info:",
+		zap.String("manufacturer", info.Manufacturer),
+		zap.String("speed", info.Speed),
+		zap.String("bcdDevice", info.BcdDevice),
+		zap.String("bDeviceClass", info.BDeviceClass),
+	)
+
 	mountPoint := sysutil.WaitForMount(devName)
 	if mountPoint == "" {
 		sysutil.LogSugar.Warn("Device detected but mount point not found (timeout)", zap.String("dev", devName))
@@ -105,14 +118,19 @@ func (w *linuxWatcher) handleAdd(uevent netlink.UEvent) {
 	}
 
 	w.events <- model.USBEvent{
-		Action:     "add",
-		DevicePath: devName,
-		MountPoint: mountPoint,
-		IdVendor:   vid,
-		IdProduct:  pid,
-		Serial:     serial,
-		DeviceType: devType,
-		TimeStamp:  time.Now(),
+		Action:          "add",
+		DevicePath:      devName,
+		MountPoint:      mountPoint,
+		IdVendor:        vid,
+		IdProduct:       pid,
+		Serial:          serial,
+		DeviceType:      devType,
+		Manufacturer:    info.Manufacturer,
+		Speed:           info.Speed,
+		BcdDevice:       info.BcdDevice,
+		BDeviceClass:    info.BDeviceClass,
+		BDeviceSubClass: info.BDeviceSubClass,
+		TimeStamp:       time.Now(),
 	}
 
 	if isBad {
@@ -156,6 +174,7 @@ func (w *linuxWatcher) scanExistingUSB() {
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
+	foundCount := 0
 	for scanner.Scan() {
 		line := scanner.Text()
 
@@ -193,27 +212,38 @@ func (w *linuxWatcher) scanExistingUSB() {
 			serial := readFile(filepath.Join(usbRoot, "serial"))
 			product := readFile(filepath.Join(usbRoot, "product"))
 			isBad, devType := analysis.CheckBadUSB(usbRoot)
+			info := CollectDeviceInfo(usbRoot)
+			foundCount++
 			sysutil.Log.Info("🔍 Found existing USB device during scan",
 				zap.String("mount", mountPoint),
 				zap.String("dev", devPath))
 			// 发送事件
 			w.events <- model.USBEvent{
-				Action:     "add",
-				DevicePath: devPath,
-				MountPoint: mountPoint,
-				IdVendor:   vid,
-				IdProduct:  pid,
-				Product:    product,
-				Serial:     serial,
-				DeviceType: devType,
-				TimeStamp:  time.Now(),
+				Action:          "add",
+				DevicePath:      devPath,
+				MountPoint:      mountPoint,
+				IdVendor:        vid,
+				IdProduct:       pid,
+				Product:         product,
+				Serial:          serial,
+				DeviceType:      devType,
+				Manufacturer:    info.Manufacturer,
+				Speed:           info.Speed,
+				BcdDevice:       info.BcdDevice,
+				BDeviceClass:    info.BDeviceClass,
+				BDeviceSubClass: info.BDeviceSubClass,
+				TimeStamp:       time.Now(),
 			}
 			if isBad {
 				sysutil.Log.Warn("🚨 POTENTIAL BADUSB DETECTED (Existing)", zap.String("serial", serial))
 			}
 		}
 	}
-	sysutil.LogSugar.Info("no existed USB!!")
+	if foundCount > 0 {
+		sysutil.LogSugar.Infof("scanExistingUSB: found %d USB device(s)", foundCount)
+	} else {
+		sysutil.LogSugar.Info("no existed USB found during initial scan")
+	}
 }
 
 func (w *linuxWatcher) handleUdevEvent(uevent netlink.UEvent) {
@@ -239,9 +269,9 @@ func (w *linuxWatcher) handleUdevEvent(uevent netlink.UEvent) {
 
 				// 执行物理阻断
 				if err := blackwhitelist.BlockDevice(busID); err != nil {
-					log.Printf("❌ 阻断失败: %v", err)
+					sysutil.Log.Error("阻断失败", zap.Error(err))
 				} else {
-					log.Println("✅ 设备已成功阻断 (Authorized=0)")
+					sysutil.Log.Info("设备已成功阻断 (Authorized=0)")
 				}
 
 				// 阻断后直接 return，不要启动后面的文件监控了
@@ -256,7 +286,8 @@ func (w *linuxWatcher) handleUdevEvent(uevent netlink.UEvent) {
 		if uevent.Action == "add" {
 			go w.handleAdd(uevent)
 		} else if uevent.Action == "remove" {
-			w.events <- model.USBEvent{Action: "remove", DevicePath: uevent.Env["DEVNAME"], TimeStamp: time.Now()}
+			mountPoint := sysutil.WaitForMount("/dev/" + uevent.Env["DEVNAME"])
+				w.events <- model.USBEvent{Action: "remove", DevicePath: uevent.Env["DEVNAME"], MountPoint: mountPoint, TimeStamp: time.Now()}
 		}
 	}
 }

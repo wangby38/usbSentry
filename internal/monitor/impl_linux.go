@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -28,9 +29,13 @@ type fanotifyMonitor struct {
 	selfPid    int
 	events     chan model.FileEvent
 	stop       chan struct{}
+	stats      *EventStats
+	reporter   *StatsReporter
+	wg         sync.WaitGroup
 }
 
 var typeInspector = analysis.NewTypeInspector()
+var quarantineMgr *analysis.QuarantineManager
 
 func newMonitor() (FileMonitor, error) {
 	// 1. 初始化 Blocker (保镖): 负责拦截、执行检查、文件写入完成检查
@@ -60,24 +65,38 @@ func newMonitor() (FileMonitor, error) {
 		return nil, fmt.Errorf("fanotify init recorder failed: %v", err)
 	}
 
+	// Initialize quarantine manager (once)
+	if quarantineMgr == nil {
+		qm, err := analysis.NewQuarantineManager("")
+		if err != nil {
+			sysutil.LogSugar.Warnf("Quarantine not available: %v", err)
+		} else {
+			quarantineMgr = qm
+		}
+	}
+
 	return &fanotifyMonitor{
 		fdBlocker:  fdBlocker,
 		fdRecorder: fdRecorder,
 		mountPath:  "",
 		selfPid:    os.Getpid(),
-		events:     make(chan model.FileEvent, 100),
+		events:     make(chan model.FileEvent, EventChannelSize),
 		stop:       make(chan struct{}),
+		stats:      NewEventStats(),
 	}, nil
 }
 
 func (f *fanotifyMonitor) Start() {
 	// 启动两个协程，分别监听两个 FD
+	f.wg.Add(2)
 	go f.readLoop(f.fdBlocker, "Blocker")
 	go f.readLoop(f.fdRecorder, "Recorder")
 }
 
 // 通用的读取循环
 func (f *fanotifyMonitor) readLoop(fd int, role string) {
+	defer f.wg.Done()
+
 	var buf [4096]byte
 	for {
 		select {
@@ -154,7 +173,7 @@ func (f *fanotifyMonitor) AddWatch(mountPath string) error {
 
 	err = unix.FanotifyMark(f.fdRecorder, unix.FAN_MARK_ADD|unix.FAN_MARK_FILESYSTEM, maskRecorder, unix.AT_FDCWD, mountPath)
 	if err != nil {
-		fmt.Println("⚠️  Warning: Recorder MARK_FILESYSTEM failed, trying directory only mode...")
+		sysutil.LogSugar.Warn("Recorder MARK_FILESYSTEM failed, trying directory only mode...")
 		// 尝试降级
 		err = unix.FanotifyMark(f.fdRecorder, unix.FAN_MARK_ADD, maskRecorder, unix.AT_FDCWD, mountPath)
 	}
@@ -163,12 +182,15 @@ func (f *fanotifyMonitor) AddWatch(mountPath string) error {
 }
 
 func (f *fanotifyMonitor) RemoveWatch(mountPath string) {
-	// 两个都要移除
 	maskBlocker := uint64(unix.FAN_CLOSE_WRITE | unix.FAN_OPEN_PERM | unix.FAN_OPEN_EXEC_PERM | unix.FAN_EVENT_ON_CHILD)
-	_ = unix.FanotifyMark(f.fdBlocker, unix.FAN_MARK_REMOVE|unix.FAN_MARK_MOUNT, maskBlocker, unix.AT_FDCWD, mountPath)
+	if err := unix.FanotifyMark(f.fdBlocker, unix.FAN_MARK_REMOVE|unix.FAN_MARK_MOUNT, maskBlocker, unix.AT_FDCWD, mountPath); err != nil {
+		sysutil.LogSugar.Errorf("RemoveWatch blocker mark failed for %s: %v", mountPath, err)
+	}
 
 	maskRecorder := uint64(unix.FAN_CREATE | unix.FAN_DELETE | unix.FAN_MOVED_TO | unix.FAN_MOVED_FROM | unix.FAN_ONDIR | unix.FAN_EVENT_ON_CHILD)
-	_ = unix.FanotifyMark(f.fdRecorder, unix.FAN_MARK_REMOVE|unix.FAN_MARK_MOUNT, maskRecorder, unix.AT_FDCWD, mountPath)
+	if err := unix.FanotifyMark(f.fdRecorder, unix.FAN_MARK_REMOVE|unix.FAN_MARK_MOUNT, maskRecorder, unix.AT_FDCWD, mountPath); err != nil {
+		sysutil.LogSugar.Errorf("RemoveWatch recorder mark failed for %s: %v", mountPath, err)
+	}
 }
 
 // processOneEvent 处理单个事件
@@ -240,7 +262,11 @@ func (f *fanotifyMonitor) processOneEvent(fd int, role string, eventBuf []byte, 
 			}
 			if result.IsMasquerade {
 				sysutil.LogSugar.Warnf("🚨 Masquerade detected! [%s] %s", result.RiskLevel, path)
-				// 隔离逻辑...
+				if quarantineMgr != nil {
+						if _, err := quarantineMgr.Quarantine(path); err != nil {
+							sysutil.LogSugar.Errorf("Quarantine failed for %s: %v", path, err)
+						}
+					}
 			} else {
 				sysutil.LogSugar.Infof("✅ Safe file: %s (Type: %s)", path, result.RealExt)
 			}
@@ -253,7 +279,10 @@ func (f *fanotifyMonitor) processOneEvent(fd int, role string, eventBuf []byte, 
 		f.replyAllow(fd, metadata.Fd)
 	}
 
-	// 4. 发送事件到 Channel
+	// 4. 事件统计
+	f.stats.Record(eventOp, procName)
+
+	// 5. 发送事件到 Channel
 	f.events <- model.FileEvent{
 		PID:       pid,
 		ProcName:  procName,
@@ -325,8 +354,17 @@ func getProcName(pid int) string {
 	return strings.TrimSpace(string(b))
 }
 
+func (f *fanotifyMonitor) StartStatsReporter(intervalSec int) {
+	f.reporter = NewStatsReporter(f.stats, time.Duration(intervalSec)*time.Second)
+	f.reporter.Start()
+}
+
 func (f *fanotifyMonitor) Stop() {
+	if f.reporter != nil {
+		f.reporter.Stop()
+	}
 	close(f.stop)
+	f.wg.Wait()
 	unix.Close(f.fdBlocker)
 	unix.Close(f.fdRecorder)
 }
@@ -341,9 +379,6 @@ func getEventOp(mask uint64) string {
 	if mask&unix.FAN_OPEN_EXEC_PERM == unix.FAN_OPEN_EXEC_PERM {
 		events = append(events, "EXEC_PERM")
 	}
-	if mask&unix.FAN_ACCESS_PERM == unix.FAN_ACCESS_PERM {
-		events = append(events, "ACCESS_PERM")
-	}
 	if mask&unix.FAN_CREATE == unix.FAN_CREATE {
 		events = append(events, "CREATE")
 	}
@@ -355,6 +390,9 @@ func getEventOp(mask uint64) string {
 	}
 	if mask&unix.FAN_MOVED_TO != 0 {
 		events = append(events, "MOVED_TO")
+	}
+	if mask&unix.FAN_MOVED_FROM != 0 {
+		events = append(events, "MOVED_FROM")
 	}
 
 	if len(events) == 0 {
@@ -370,5 +408,8 @@ func (f *fanotifyMonitor) replyAllow(fanotifyFd int, fileFd int32) {
 		Response: uint32(unix.FAN_ALLOW),
 	}
 	buf := (*[unsafe.Sizeof(response)]byte)(unsafe.Pointer(&response))[:]
-	unix.Write(fanotifyFd, buf)
+	_, err := unix.Write(fanotifyFd, buf)
+	if err != nil {
+		sysutil.LogSugar.Errorf("fanotify replyAllow write failed: %v", err)
+	}
 }

@@ -54,15 +54,3 @@ type FileHandle struct {
 // 		int           handle_type;    /* Handle type [out] */
 // 		unsigned char f_handle[0];    /* File identifier (sized by caller) [out] */
 // };
-
-/*
-type FanotifyEventMetadata struct {
-	Event_len    uint32
-	Vers         uint8
-	Reserved     uint8
-	Metadata_len uint16
-	Mask         uint64
-	Fd           int32
-	Pid          int32
-}
-*/
